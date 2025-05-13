@@ -25,9 +25,11 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             json_request = json.loads(post_data.decode('utf-8'))
             method = json_request.get('method')
-            params = json_request.get('params')
+            original_params = json_request.get('params') # Store original params
             rpc_id = json_request.get('id')
-            token = json_request.get('token')
+            
+            token_from_body = json_request.get('token') # Attempt to get token from body field
+            effective_params = original_params # Params to be used by methods
 
             if method == 'purchase_token':
                 # Generate a new JWT token
@@ -51,8 +53,19 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
                 response_data = {'jsonrpc': '2.0', 'result': new_token, 'id': rpc_id}
                 self.send_response(200)
             elif method in ['get_time', 'echo']:
-                # Verify token for protected methods
-                if not token:
+                token_to_validate = token_from_body
+                
+                # If token not in body, try to extract from original_params[0]
+                if not token_to_validate and isinstance(original_params, list) and len(original_params) > 0:
+                    token_to_validate = original_params[0] # Assume this is the token
+                    
+                    # Adjust effective_params for the actual method logic
+                    if method == 'echo':
+                        effective_params = original_params[1:] if len(original_params) > 1 else []
+                    else: # for get_time
+                        effective_params = []
+
+                if not token_to_validate:
                     response_data = {
                         'jsonrpc': '2.0',
                         'error': {'code': -32600, 'message': 'No access: Missing token'},
@@ -61,23 +74,21 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.send_response(401)
                 else:
                     try:
-                        # Decode and verify the token
-                        payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+                        # Decode and verify the token_to_validate
+                        payload = jwt.decode(token_to_validate, SECRET_KEY, algorithms=['HS256'])
                         token_id = payload.get('token_id')
                         
-                        # Check if token is in our store
                         if token_id not in ISSUED_TOKENS:
                             raise jwt.InvalidTokenError("Token not found in issued tokens")
                         
-                        # Process the method now that token is verified
                         if method == 'get_time':
                             current_time_gmt = formatdate(timeval=None, localtime=False, usegmt=True)
                             response_data = {'jsonrpc': '2.0', 'result': current_time_gmt, 'id': rpc_id}
                             self.send_response(200)
                         elif method == 'echo':
-                            # Add "Dear User" before the message
-                            if isinstance(params, list) and len(params) > 0:
-                                modified_response = f"Dear User, {params[0]}"
+                            # Use effective_params for echo logic
+                            if isinstance(effective_params, list) and len(effective_params) > 0:
+                                modified_response = f"Dear User, {effective_params[0]}"
                             else:
                                 modified_response = "Dear User"
                             response_data = {'jsonrpc': '2.0', 'result': modified_response, 'id': rpc_id}
