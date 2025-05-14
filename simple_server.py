@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 from email.utils import formatdate
 from pysui import SuiConfig, SyncClient
 from pysui.sui import sui_txresults
+from pysui.sui.sui_builders.get_builders import QueryTransactions
+from pysui.sui.sui_types.collections import SuiMap
+import traceback
 
 PORT = 8080
 HOST = '0.0.0.0'
@@ -53,7 +56,9 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
             effective_params = original_params # Params to be used by methods
 
             if method == 'purchase_token':
+                print("[purchase_token] Entered method.")
                 if not sui_client:
+                    print("[purchase_token] Sui client not initialized.")
                     response_data = {
                         'jsonrpc': '2.0',
                         'error': {'code': -32000, 'message': 'Sui client not initialized'},
@@ -61,56 +66,83 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
                     }
                     self.send_response(500)
                 else:
+                    print("[purchase_token] Sui client initialized. Proceeding with payment check.")
                     payment_received = False
                     try:
+                        print("[purchase_token] Attempting Sui transaction query.")
                         # Query for recent transactions to the monitored address
                         # We are checking for transactions TO the address
-                        query = {
-                            "filter": {"ToAddress": SUI_ADDRESS_TO_MONITOR},
-                            # "filter": {"ChangedObject": SUI_ADDRESS_TO_MONITOR}, # Alternative: if address is an object
-                            # "filter": {"FromAddress": SUI_ADDRESS_TO_MONITOR}, # Alternative: if address is sender
-                        }
-                        
-                        # Get current time in milliseconds UTC
-                        now_utc_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                        ten_seconds_ago_ms = now_utc_ms - 10000
+                        filter_dict = {"ToAddress": SUI_ADDRESS_TO_MONITOR}
+                        # query_map_for_builder = SuiMap(key="filter", value=filter_dict)
+                        # The QueryTransactions builder expects the query argument to be a SuiMap
+                        # representing the entire query structure, not just the filter value.
+                        # The SuiMap itself should represent the {'filter': {'ToAddress': '...'}}
+                        # However, the QueryTransactions builder definition is: __init__(*, query: SuiMap, ...)
+                        # This implies the `query` parameter to QueryTransactions should be the SuiMap itself.
 
-                        # Fetch recent transactions, newest first
-                        # We fetch a small number and check their timestamps
-                        # Note: pysui SDK might have direct time filtering in future versions or specific methods.
-                        # For now, we filter client-side after fetching recent txs.
-                        
-                        tx_query_result = sui_client.execute(
-                            sui_client.SUI_RPC_VERSION_QUERY_TRANSACTION_BLOCKS(
-                                query=query,
-                                cursor=None, # Start from the beginning
-                                limit=10,    # Fetch last 10 transactions
-                                descending_order=True # Newest first
-                            )
+                        # Our current `query` variable in the calling scope is `query = {"filter": {"ToAddress": SUI_ADDRESS_TO_MONITOR}}`
+                        # The QueryTransactions builder seems to expect this entire structure as the `query` argument,
+                        # and that argument must be of type SuiMap.
+                        # Given SuiMap(key, value), it seems SuiMap is for simple key-value pairs, not complex nested dicts directly.
+                        # This implies that the `pysui` library might handle the direct python dict for the `query` parameter
+                        # in QueryTransactions, or there's a different way to construct complex SuiMap objects.
+
+                        # Let's try passing the Python dictionary directly to QueryTransactions,
+                        # as the builder might handle the conversion to the appropriate SuiMap structure internally if needed,
+                        # or the type hint `SuiMap` for the builder is a general catch-all for map-like structures it accepts.
+                        # The error was specifically about SuiMap constructor, not QueryTransactions constructor directly.
+
+                        rpc_query_structure = {
+                            "filter": {"ToAddress": SUI_ADDRESS_TO_MONITOR},
+                            "options": None # Explicitly setting options to None or a valid SuiMap if needed by API
+                        }
+
+                        # Instantiate the QueryTransactions builder
+                        query_builder = QueryTransactions(
+                            query=rpc_query_structure, # Passing Python dict directly, builder might handle it.
+                            cursor=None,    # Start from the beginning
+                            limit=10,       # Fetch last 10 transactions
+                            descending_order=True # Newest first
                         )
+                        print(f"[purchase_token] Constructed QueryTransactions builder with params: {query_builder.params}") # DBG
+
+                        tx_query_result = sui_client.execute(query_builder)
+                        
+                        print(f"[purchase_token] Sui query raw result object: {tx_query_result}") # DBG
+                        if hasattr(tx_query_result, 'result_string'):
+                             print(f"[purchase_token] Sui query result_string: {tx_query_result.result_string}")
+                        if hasattr(tx_query_result, 'result_data'):
+                             print(f"[purchase_token] Sui query result_data: {tx_query_result.result_data}")
+
 
                         if tx_query_result.is_ok():
+                            print("[purchase_token] Sui query OK.")
                             queried_tx_blocks: list[sui_txresults.SuiTransactionBlockResponse] = tx_query_result.result_data.data
-                            for tx_block in queried_tx_blocks:
-                                if tx_block.timestamp_ms and int(tx_block.timestamp_ms) >= ten_seconds_ago_ms:
+                            print(f"[purchase_token] Found {len(queried_tx_blocks)} transaction blocks.")
+                            for i, tx_block in enumerate(queried_tx_blocks):
+                                print(f"[purchase_token] Checking tx {i+1}: digest={tx_block.digest if hasattr(tx_block, 'digest') else 'N/A'}, timestamp_ms={tx_block.timestamp_ms if hasattr(tx_block, 'timestamp_ms') else 'N/A'}")
+                                if hasattr(tx_block, 'timestamp_ms') and tx_block.timestamp_ms and int(tx_block.timestamp_ms) >= ten_seconds_ago_ms:
                                     # Further check if this specific transaction is relevant (e.g. amount, type) if needed
                                     # For now, any recent transaction to the address is considered payment
-                                    print(f"Found recent transaction: {tx_block.digest} at {tx_block.timestamp_ms}")
+                                    print(f"[purchase_token] Found recent transaction: {tx_block.digest if hasattr(tx_block, 'digest') else 'N/A'}")
                                     payment_received = True
                                     break 
                         else:
-                            print(f"Error querying Sui transactions: {tx_query_result.result_string}")
+                            print(f"[purchase_token] Error querying Sui transactions. Result status: {'OK' if tx_query_result.is_ok() else 'Error'}. Result string: {tx_query_result.result_string if hasattr(tx_query_result, 'result_string') else 'N/A'}")
 
 
-                    except Exception as e:
-                        print(f"Error during Sui transaction check: {str(e)}")
-                        # Potentially send an internal error, or proceed to "payment not received"
-                        # For now, we assume payment not received if any error occurs here
+                    except Exception as e_sui:
+                        print("[purchase_token] --- Exception during Sui transaction check ---")
+                        traceback.print_exc()
+                        print("---------------------------------------------------------")
+                        # payment_received remains False
 
+                    print(f"[purchase_token] Payment received status: {payment_received}")
                     if payment_received:
+                        print("[purchase_token] Payment received. Generating token.")
                         # Generate a new JWT token
                         token_id = str(uuid.uuid4())
-                        expiration = datetime.utcnow() + timedelta(hours=1) # utcnow is deprecated, use datetime.now(timezone.utc)
+                        expiration = datetime.now(timezone.utc) + timedelta(hours=1)
                         
                         payload = {
                             'token_id': token_id,
@@ -129,6 +161,7 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
                         response_data = {'jsonrpc': '2.0', 'result': new_token, 'id': rpc_id}
                         self.send_response(200)
                     else:
+                        print("[purchase_token] Payment not received. Returning 402.")
                         response_data = {
                             'jsonrpc': '2.0',
                             'error': {'code': -32001, 'message': 'Payment not received'},
@@ -166,7 +199,12 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
                         
                         # Check if token has expired based on our stored 'expires_at'
                         # Corrected to use timezone-aware datetime
-                        if ISSUED_TOKENS[token_id]['expires_at'].replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+                        # Ensure ISSUED_TOKENS[token_id]['expires_at'] is timezone-aware if it comes from old data
+                        expires_at_val = ISSUED_TOKENS[token_id]['expires_at']
+                        if not expires_at_val.tzinfo:
+                           expires_at_val = expires_at_val.replace(tzinfo=timezone.utc)
+
+                        if expires_at_val < datetime.now(timezone.utc):
                             ISSUED_TOKENS.pop(token_id) # Clean up expired token from memory
                             raise jwt.ExpiredSignatureError("Token has expired based on server record")
 
@@ -213,6 +251,9 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
             }
             self.send_response(400)
         except Exception as e:
+            print("---Outer Exception Caught ( منجر به 500) ---")
+            traceback.print_exc()
+            print("--------------------------------------------")
             response_data = {
                 'jsonrpc': '2.0',
                 'error': {'code': -32603, 'message': f'Internal error: {str(e)}'},
