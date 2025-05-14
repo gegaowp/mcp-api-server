@@ -6,10 +6,12 @@ import jwt
 import uuid
 from datetime import datetime, timedelta, timezone
 from email.utils import formatdate
-from pysui import SuiConfig, SyncClient
+from pysui import SuiConfig, SyncClient, SuiRpcResult
 from pysui.sui import sui_txresults
-from pysui.sui.sui_builders.get_builders import QueryTransactions
-from pysui.sui.sui_types.collections import SuiMap
+from pysui.sui.sui_builders.get_builders import QueryTransactions, GetMultipleTx, GetTx
+from pysui.sui.sui_types.transaction_filter import ToAddressQuery
+from pysui.sui.sui_types.collections import SuiArray
+from pysui.sui.sui_types.scalars import SuiString
 import traceback
 
 PORT = 8080
@@ -69,67 +71,67 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
                     print("[purchase_token] Sui client initialized. Proceeding with payment check.")
                     payment_received = False
                     try:
-                        print("[purchase_token] Attempting Sui transaction query.")
-                        # Query for recent transactions to the monitored address
-                        # We are checking for transactions TO the address
-                        filter_dict = {"ToAddress": SUI_ADDRESS_TO_MONITOR}
-                        # query_map_for_builder = SuiMap(key="filter", value=filter_dict)
-                        # The QueryTransactions builder expects the query argument to be a SuiMap
-                        # representing the entire query structure, not just the filter value.
-                        # The SuiMap itself should represent the {'filter': {'ToAddress': '...'}}
-                        # However, the QueryTransactions builder definition is: __init__(*, query: SuiMap, ...)
-                        # This implies the `query` parameter to QueryTransactions should be the SuiMap itself.
-
-                        # Our current `query` variable in the calling scope is `query = {"filter": {"ToAddress": SUI_ADDRESS_TO_MONITOR}}`
-                        # The QueryTransactions builder seems to expect this entire structure as the `query` argument,
-                        # and that argument must be of type SuiMap.
-                        # Given SuiMap(key, value), it seems SuiMap is for simple key-value pairs, not complex nested dicts directly.
-                        # This implies that the `pysui` library might handle the direct python dict for the `query` parameter
-                        # in QueryTransactions, or there's a different way to construct complex SuiMap objects.
-
-                        # Let's try passing the Python dictionary directly to QueryTransactions,
-                        # as the builder might handle the conversion to the appropriate SuiMap structure internally if needed,
-                        # or the type hint `SuiMap` for the builder is a general catch-all for map-like structures it accepts.
-                        # The error was specifically about SuiMap constructor, not QueryTransactions constructor directly.
-
-                        rpc_query_structure = {
-                            "filter": {"ToAddress": SUI_ADDRESS_TO_MONITOR},
-                            "options": None # Explicitly setting options to None or a valid SuiMap if needed by API
-                        }
-
-                        # Instantiate the QueryTransactions builder
-                        query_builder = QueryTransactions(
-                            query=rpc_query_structure, # Passing Python dict directly, builder might handle it.
-                            cursor=None,    # Start from the beginning
-                            limit=10,       # Fetch last 10 transactions
-                            descending_order=True # Newest first
-                        )
-                        print(f"[purchase_token] Constructed QueryTransactions builder with params: {query_builder.params}") # DBG
-
-                        tx_query_result = sui_client.execute(query_builder)
+                        print("[purchase_token] Attempting Sui transaction query (2-phase approach).")
                         
-                        print(f"[purchase_token] Sui query raw result object: {tx_query_result}") # DBG
-                        if hasattr(tx_query_result, 'result_string'):
-                             print(f"[purchase_token] Sui query result_string: {tx_query_result.result_string}")
-                        if hasattr(tx_query_result, 'result_data'):
-                             print(f"[purchase_token] Sui query result_data: {tx_query_result.result_data}")
-
-
-                        if tx_query_result.is_ok():
-                            print("[purchase_token] Sui query OK.")
-                            queried_tx_blocks: list[sui_txresults.SuiTransactionBlockResponse] = tx_query_result.result_data.data
-                            print(f"[purchase_token] Found {len(queried_tx_blocks)} transaction blocks.")
-                            for i, tx_block in enumerate(queried_tx_blocks):
-                                print(f"[purchase_token] Checking tx {i+1}: digest={tx_block.digest if hasattr(tx_block, 'digest') else 'N/A'}, timestamp_ms={tx_block.timestamp_ms if hasattr(tx_block, 'timestamp_ms') else 'N/A'}")
-                                if hasattr(tx_block, 'timestamp_ms') and tx_block.timestamp_ms and int(tx_block.timestamp_ms) >= ten_seconds_ago_ms:
-                                    # Further check if this specific transaction is relevant (e.g. amount, type) if needed
-                                    # For now, any recent transaction to the address is considered payment
-                                    print(f"[purchase_token] Found recent transaction: {tx_block.digest if hasattr(tx_block, 'digest') else 'N/A'}")
-                                    payment_received = True
-                                    break 
+                        # Phase 1: Get transaction digests
+                        print("[purchase_token] Phase 1: Fetching transaction digests.")
+                        to_address_filter = ToAddressQuery(address=SUI_ADDRESS_TO_MONITOR)
+                        query_builder_digests = QueryTransactions(
+                            query=to_address_filter, 
+                            cursor=None,
+                            limit=10, 
+                            descending_order=True
+                        )
+                        print(f"[purchase_token] Digest query builder params: {query_builder_digests.params}")
+                        result_digests: SuiRpcResult = sui_client.execute(query_builder_digests)
+                        
+                        transaction_digests_list = []
+                        if result_digests.is_ok() and result_digests.result_data and hasattr(result_digests.result_data, 'data') and result_digests.result_data.data:
+                            transaction_digests_list = [tx.digest for tx in result_digests.result_data.data if hasattr(tx, 'digest') and tx.digest]
+                            print(f"[purchase_token] Found {len(transaction_digests_list)} digests: {transaction_digests_list}")
                         else:
-                            print(f"[purchase_token] Error querying Sui transactions. Result status: {'OK' if tx_query_result.is_ok() else 'Error'}. Result string: {tx_query_result.result_string if hasattr(tx_query_result, 'result_string') else 'N/A'}")
+                            print(f"[purchase_token] Phase 1 (QueryTransactions) failed or no digests found: {result_digests.result_string if hasattr(result_digests, 'result_string') else 'No error string'}")
 
+                        if transaction_digests_list:
+                            print("[purchase_token] Phase 2: Fetching transaction details for digests.")
+                            tx_options_dict = GetTx.default_options()
+                            # Optionally ensure critical fields for timestamp are requested if default is not enough
+                            # tx_options_dict["showInput"] = True # Already default
+                            print(f"[purchase_token] Using options for GetMultipleTx: {tx_options_dict}")
+
+                            sui_digest_array = SuiArray([SuiString(d) for d in transaction_digests_list])
+                            get_multiple_tx_builder = GetMultipleTx(digests=sui_digest_array, options=tx_options_dict)
+                            detailed_tx_result: SuiRpcResult = sui_client.execute(get_multiple_tx_builder)
+
+                            if detailed_tx_result.is_ok():
+                                print(f"[purchase_token] GetMultipleTx successful. Result data type: {type(detailed_tx_result.result_data)}")
+                                detailed_txs_data = detailed_tx_result.result_data
+                                actual_tx_list = []
+                                if hasattr(detailed_txs_data, 'transactions') and isinstance(detailed_txs_data.transactions, list):
+                                    actual_tx_list = detailed_txs_data.transactions
+                                elif hasattr(detailed_txs_data, 'data') and isinstance(detailed_txs_data.data, list):
+                                    actual_tx_list = detailed_txs_data.data # Fallback, though TxResponseArray uses .transactions
+                                
+                                if actual_tx_list:
+                                    print(f"[purchase_token] Processing {len(actual_tx_list)} detailed transactions from GetMultipleTx.")
+                                    now_utc_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                                    ten_seconds_ago_ms = now_utc_ms - 10000
+                                    print(f"[purchase_token] Current time window for check: {ten_seconds_ago_ms}ms to {now_utc_ms}ms.")
+                                    for tx_block in actual_tx_list:
+                                        # Accessing attributes directly from the TxResponse objects within TxResponseArray
+                                        tx_digest = tx_block.digest if hasattr(tx_block, 'digest') else 'N/A'
+                                        tx_timestamp_ms = tx_block.timestamp_ms if hasattr(tx_block, 'timestamp_ms') else None
+                                        print(f"[purchase_token] Checking detailed tx: Digest={tx_digest}, TimestampMs={tx_timestamp_ms}")
+                                        if tx_timestamp_ms and int(tx_timestamp_ms) >= ten_seconds_ago_ms:
+                                            print(f"[purchase_token] Found recent transaction via GetMultipleTx: {tx_digest}")
+                                            payment_received = True
+                                            break
+                                else:
+                                    print("[purchase_token] GetMultipleTx returned OK, but no transactions found in the response list.")
+                            else:
+                                print(f"[purchase_token] Phase 2 (GetMultipleTx) failed: {detailed_tx_result.result_string if hasattr(detailed_tx_result, 'result_string') else 'No error string'}")
+                        else:
+                            print("[purchase_token] No transaction digests found in Phase 1 to fetch details for.")
 
                     except Exception as e_sui:
                         print("[purchase_token] --- Exception during Sui transaction check ---")
